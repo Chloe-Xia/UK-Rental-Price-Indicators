@@ -12,10 +12,15 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import shutil
+import sys
 from pathlib import Path
 
 from pyspark.sql import SparkSession, Window, functions as F
+
+# Python workers must use this interpreter, not whichever python is first on PATH.
+os.environ["PYSPARK_PYTHON"] = sys.executable
 
 
 ROOT = Path(__file__).resolve().parent

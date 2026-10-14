@@ -8,13 +8,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pyspark.sql import SparkSession, Window, functions as F, types as T
+
+# Python workers must use this interpreter, not whichever python is first on PATH.
+os.environ["PYSPARK_PYTHON"] = sys.executable
 
 from prepare_reference import REGIONS
 

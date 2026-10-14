@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 from pyspark.sql import SparkSession, functions as F
+
+# Python workers must use this interpreter, not whichever python is first on PATH.
+os.environ["PYSPARK_PYTHON"] = sys.executable
 
 
 def main():
