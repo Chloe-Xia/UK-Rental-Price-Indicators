@@ -43,6 +43,14 @@ def main():
                 F.col("gdhi_per_head_gbp").isNull() | F.col("population").isNull()).count() == 0,
             "incomplete_crime_not_zero_filled": panel.filter(
                 (~F.col("crime_coverage_complete")) & F.col("crime_count").isNotNull()).count() == 0,
+            "partial_uploads_not_counted": panel.filter(
+                F.col("crime_partial_upload") & F.col("crime_count").isNotNull()).count() == 0,
+            "recorded_crime_present_and_positive": panel.filter(
+                F.col("recorded_crime_quarter_count").isNull() |
+                (F.col("recorded_crime_quarter_count") <= 0)).count() == 0,
+            "recorded_crime_constant_within_quarter": panel.groupBy("lad_code", "recorded_crime_quarter")
+                .agg(F.countDistinct("recorded_crime_quarter_count").alias("n"), F.count("*").alias("months"))
+                .filter("n != 1 or months != 3").count() == 0,
             "csv_matches_parquet": csv_rows == rows,
             "ten_region_csvs_match": len(region_rows) == 10 and sum(region_rows.values()) == rows,
             "renamed_lads_have_income": panel.filter(

@@ -34,13 +34,14 @@ CRIME_GROUPS = {
 PROPERTY_TYPES = {"D": "detached", "S": "semi", "T": "terraced", "F": "flat"}
 LAD_TYPES = {"E06": "unitary", "E07": "district", "E08": "metropolitan",
              "E09": "london_borough", "W06": "welsh_unitary"}
-# A force-month publishing fewer than half its typical monthly records, or a
-# local authority receiving under a quarter of its typical count, is a partial
-# upload (e.g. Greater Manchester 2022-08, Leicestershire 2020-03), not a fall
-# in crime. "Typical" is the full-period median, used only for this QC rule.
-PARTIAL_FORCE_RATIO = 0.5
-PARTIAL_LAD_RATIO = 0.25
 MIN_CRIME_MONTHS = 6
+# Street-crime gaps (missing or partial months) of up to this many consecutive
+# months are filled from the same month a year earlier, scaled by the regional
+# year-on-year change. Longer gaps (Greater Manchester 2019-07 to 2024-12) stay
+# null; the Home Office recorded-crime features cover them.
+MAX_IMPUTED_GAP = 12
+RECORDED_GROUPS = ["violence", "sexual", "robbery", "burglary", "theft", "damage", "drugs",
+                   "public_order", "misc"]
 
 # role -> (use_association, use_forecast)
 ROLE_USE = {"id": (False, False), "target": (False, False), "target_variant": (False, False),
@@ -52,6 +53,7 @@ FEATURES = [
     ("lad_code", "id", "id", "Local authority code (primary key with month)"),
     ("lad_name", "id", "id", "Local authority name"),
     ("country", "id", "predictor", "England or Wales"),
+    ("dominant_force", "id", "id", "police.uk force supplying most of the authority's street crime"),
     ("month", "id", "id", "YYYY-MM (primary key with lad_code)"),
     ("year", "time", "predictor", "Calendar year"),
     ("split", "id", "id", "history (2015) / train (2016-2022) / validation (2023) / test (2024)"),
@@ -109,7 +111,8 @@ FEATURES = [
      "Share of standard-market sales over t-11..t that are leasehold"),
     ("price_to_income_ratio", "housing_market", "contemporaneous",
      "sales_median_roll12 / gdhi_per_head_gbp (per-head, not per-household, income)"),
-    ("crime_per_1000", "crime", "contemporaneous", "Street crimes in month t per 1000 residents"),
+    ("crime_per_1000", "crime", "contemporaneous",
+     "police.uk street crimes in month t per 1000 residents (observed, or imputed if crime_imputed)"),
     ("crime_per_1000_roll12", "crime", "contemporaneous",
      "Mean monthly street crimes over valid months in t-11..t per 1000 residents"),
     ("crime_yoy_log_change", "crime", "contemporaneous",
@@ -117,6 +120,14 @@ FEATURES = [
     *[(f"crime_{group}_per_1000_roll12", "crime", "contemporaneous",
        f"Mean monthly {' / '.join(types)} over valid months in t-11..t per 1000 residents")
       for group, types in CRIME_GROUPS.items()],
+    ("recorded_crime_per_1000_roll4q", "recorded_crime", "contemporaneous",
+     "Home Office police recorded crime (excl. fraud) over the 4 quarters ending with the quarter "
+     "containing t, as a monthly average per 1000 residents"),
+    ("recorded_crime_yoy_log_change", "recorded_crime", "contemporaneous",
+     "log recorded crime in the quarter containing t minus the same quarter a year earlier"),
+    *[(f"recorded_{group}_per_1000_roll4q", "recorded_crime", "contemporaneous",
+       f"Recorded {group.replace('_', ' ')} offences, 4 quarters ending with the quarter containing t, "
+       "monthly average per 1000 residents") for group in RECORDED_GROUPS],
     ("neighbour_log_sales_median_roll12", "spatial", "contemporaneous",
      "Mean log_sales_median_roll12 of the 5 nearest local authorities"),
     ("neighbour_crime_per_1000_roll12", "spatial", "contemporaneous",
@@ -137,7 +148,19 @@ FEATURES = [
     ("crime_partial_upload", "crime", "quality_flag",
      "1 if the dominant force published < 50% of its median monthly records, or the local "
      "authority received < 25% of its median monthly count"),
-    ("crime_months_in_roll12", "crime", "quality_flag", "Valid crime months within t-11..t"),
+    ("crime_imputed", "crime", "quality_flag",
+     "1 if street crime for month t is imputed: same month a year earlier x regional "
+     "year-on-year change, for gaps of at most 12 consecutive months"),
+    ("crime_months_in_roll12", "crime", "quality_flag",
+     "Observed or imputed street-crime months within t-11..t"),
+    ("recorded_crime_allocated", "recorded_crime", "quality_flag",
+     "1 if the CSP covers several local authorities and was split by population"),
+    ("recorded_crime_unassigned_share", "recorded_crime", "quality_flag",
+     "Share of the force's offences in that quarter with no CSP, redistributed to CSPs"),
+    *[(f"{name}_prevq", "recorded_crime", "lagged",
+       f"{name} for the last quarter completed before month t")
+      for name in ["recorded_crime_per_1000_roll4q", "recorded_crime_yoy_log_change",
+                   *[f"recorded_{group}_per_1000_roll4q" for group in RECORDED_GROUPS]]],
 ]
 LAG1_SOURCES = ["log_sales_median_roll12", "sales_median_yoy_log_change",
                 "sales_per_1000_residents_roll12", "flat_share_roll12", "new_build_share_roll12",
@@ -148,7 +171,11 @@ FEATURES += [(f"{name}_lag1", group, "lagged", f"{name} at t-1")
              for name, group, _, _ in FEATURES if name in LAG1_SOURCES]
 # Year-on-year changes of 3-month windows start at 2016-03, so they are not listed.
 REQUIRED_OUTSIDE_HISTORY = ["rent_lag12", "rent_yoy_log_change", "log_sales_median_roll12",
-                            "population_growth", "neighbour_rent_lag1", "price_to_income_ratio"]
+                            "population_growth", "neighbour_rent_lag1", "price_to_income_ratio",
+                            "recorded_crime_yoy_log_change_prevq"]
+REQUIRED_ALL_ROWS = ["recorded_crime_per_1000_roll4q", "recorded_crime_yoy_log_change",
+                     "recorded_crime_per_1000_roll4q_prevq",
+                     *[f"recorded_{group}_per_1000_roll4q" for group in RECORDED_GROUPS]]
 
 
 def crime_by_group(spark):
@@ -161,14 +188,23 @@ def crime_by_group(spark):
                                                 for g in CRIME_GROUPS])
 
 
-def partial_force_months(spark):
-    totals = (spark.read.parquet(str(LA / "crime_force_monthly"))
-              .groupBy("force", "month").agg(F.sum("crime_count_observed").alias("force_events")))
-    typical = totals.groupBy("force").agg(
-        F.expr("percentile_approx(force_events, 0.5)").alias("force_median"))
-    return (totals.join(typical, "force")
-            .filter(F.col("force_events") < PARTIAL_FORCE_RATIO * F.col("force_median"))
-            .select(F.col("force").alias("dominant_force"), "month", "force_events", "force_median"))
+def recorded_quarterly(spark):
+    measures = {"recorded_crime": "recorded_crime_total",
+                **{f"recorded_{g}": f"recorded_{g}" for g in RECORDED_GROUPS}}
+    frame = (reference_csv(spark, "recorded_crime_lad_quarterly.csv", measures.values())
+             .withColumn("quarter_index", F.col("year").cast("int") * 4 + F.col("quarter_number").cast("int")))
+    by_quarter = Window.partitionBy("lad_code").orderBy("quarter_index")
+    last4 = by_quarter.rowsBetween(-3, 0)
+    for name, source in measures.items():
+        frame = frame.withColumn(f"{name}_roll4q",
+                                 F.when(F.count(source).over(last4) == 4, F.sum(source).over(last4)))
+    frame = frame.withColumn("recorded_crime_yoy_log_change", F.log("recorded_crime_total") -
+                             F.lag(F.log("recorded_crime_total"), 4).over(by_quarter))
+    current = [f"{name}_roll4q" for name in measures] + ["recorded_crime_yoy_log_change"]
+    for name in current:
+        frame = frame.withColumn(f"{name}_prevq", F.lag(name, 1).over(by_quarter))
+    return frame.select("lad_code", F.col("quarter").alias("recorded_crime_quarter"),
+                        *current, *[f"{name}_prevq" for name in current])
 
 
 def sales_mix(spark):
@@ -210,7 +246,36 @@ def trailing_share(part, total, window):
                   F.sum(part).over(window) / F.sum(total).over(window))
 
 
-def build(spark, partial):
+def impute_street_crime(df, by_lad):
+    """Fill short street-crime gaps from t-12, scaled by the regional change since t-12."""
+    measures = {"crime": "crime_count_observed",
+                **{f"crime_{g}": f"crime_{g}_count" for g in CRIME_GROUPS}}
+    covered = F.col("crime_coverage_complete")
+    for name, source in measures.items():
+        df = (df.withColumn(f"{name}_obs", F.when(covered, F.coalesce(F.col(source), F.lit(0)).cast("double")))
+              .withColumn(f"{name}_obs_lag12", F.lag(f"{name}_obs", 12).over(by_lad)))
+    runs = Window.partitionBy("lad_code", "crime_coverage_complete").orderBy("t_index")
+    df = df.withColumn("gap_id", F.col("t_index") - F.row_number().over(runs))
+    df = df.withColumn("gap_length", F.count("*").over(
+        Window.partitionBy("lad_code", "crime_coverage_complete", "gap_id")))
+    pairs = df.filter(F.col("crime_obs").isNotNull() & F.col("crime_obs_lag12").isNotNull())
+
+    def ratios(keys, suffix):
+        return pairs.groupBy(*keys).agg(*[(F.sum(f"{n}_obs") / F.sum(f"{n}_obs_lag12")).alias(f"{n}_{suffix}")
+                                          for n in measures])
+
+    df = (df.join(ratios(["region_code", "month"], "region_ratio"), ["region_code", "month"], "left")
+          .join(ratios(["month"], "nation_ratio"), "month", "left"))
+    can_impute = (~covered & (F.col("gap_length") <= MAX_IMPUTED_GAP) &
+                  F.col("crime_obs_lag12").isNotNull())
+    for name in measures:
+        ratio = F.coalesce(f"{name}_region_ratio", f"{name}_nation_ratio")
+        df = df.withColumn(f"{name}_clean", F.coalesce(
+            F.col(f"{name}_obs"), F.when(can_impute, F.col(f"{name}_obs_lag12") * ratio)))
+    return df.withColumn("crime_imputed", (can_impute & F.col("crime_clean").isNotNull()).cast("int"))
+
+
+def build(spark):
     by_lad = Window.partitionBy("lad_code").orderBy("t_index")
     last3, last12 = by_lad.rowsBetween(-2, 0), by_lad.rowsBetween(-11, 0)
     geography = reference_csv(spark, "lad_geography.csv",
@@ -218,8 +283,7 @@ def build(spark, partial):
                                "urban_postcode_share", "imd_deprivation_score"]).drop("lad_name")
     df = (spark.read.parquet(str(LA / "rent_panel"))
           .join(crime_by_group(spark), ["lad_code", "month"], "left")
-          .join(partial.select("dominant_force", "month", F.lit(True).alias("partial")),
-                ["dominant_force", "month"], "left")
+          .join(recorded_quarterly(spark), ["lad_code", "recorded_crime_quarter"], "left")
           .join(sales_mix(spark), ["lad_code", "month"], "left")
           .join(prior_income(spark), ["lad_code", "feature_year"], "left")
           .join(F.broadcast(geography), "lad_code", "left"))
@@ -279,16 +343,10 @@ def build(spark, partial):
         df = df.withColumn(f"{name}_share_roll12",
                            trailing_share(f"{name}_mix_count", "mix_sales_count", last12))
 
-    covered = F.coalesce("crime_coverage_complete", F.lit(False))
-    lad_median = F.expr("percentile_approx(crime_count_observed, 0.5)").over(
-        Window.partitionBy("lad_code", "crime_coverage_complete"))
-    df = df.withColumn("crime_partial_upload", (covered & (
-        F.col("partial").isNotNull() |
-        (F.col("crime_count_observed") < PARTIAL_LAD_RATIO * lad_median))).cast("int"))
-    crime_ok = covered & (F.col("crime_partial_upload") == 0)
     per_1000 = 1000 / F.col("population")
-    df = (df.withColumn("crime_data_ok", crime_ok.cast("int"))
-          .withColumn("crime_clean", F.when(crime_ok, F.col("crime_count_observed")))
+    df = (impute_street_crime(df, by_lad)
+          .withColumn("crime_data_ok", F.col("crime_coverage_complete").cast("int"))
+          .withColumn("crime_partial_upload", F.col("crime_partial_upload").cast("int"))
           .withColumn("crime_months_in_roll12", F.count("crime_clean").over(last12))
           .withColumn("crime_per_1000", F.col("crime_clean") * per_1000)
           .withColumn("crime_per_1000_roll12",
@@ -297,10 +355,19 @@ def build(spark, partial):
           .withColumn("crime_yoy_log_change",
                       F.col("log_crime_roll3") - F.lag("log_crime_roll3", 12).over(by_lad)))
     for group in CRIME_GROUPS:
-        clean = F.when(crime_ok, F.col(f"crime_{group}_count"))
-        df = (df.withColumn(f"crime_{group}_clean", clean)
-              .withColumn(f"crime_{group}_per_1000_roll12",
-                          trailing_mean(f"crime_{group}_clean", last12, MIN_CRIME_MONTHS) * per_1000))
+        df = df.withColumn(f"crime_{group}_per_1000_roll12",
+                           trailing_mean(f"crime_{group}_clean", last12, MIN_CRIME_MONTHS) * per_1000)
+
+    monthly_per_1000 = per_1000 / 12
+    df = (df.withColumn("recorded_crime_allocated", F.col("recorded_crime_allocated").cast("int"))
+          .withColumn("recorded_crime_per_1000_roll4q", F.col("recorded_crime_roll4q") * monthly_per_1000)
+          .withColumn("recorded_crime_per_1000_roll4q_prevq",
+                      F.col("recorded_crime_roll4q_prevq") * monthly_per_1000))
+    for group in RECORDED_GROUPS:
+        df = (df.withColumn(f"recorded_{group}_per_1000_roll4q",
+                            F.col(f"recorded_{group}_roll4q") * monthly_per_1000)
+              .withColumn(f"recorded_{group}_per_1000_roll4q_prevq",
+                          F.col(f"recorded_{group}_roll4q_prevq") * monthly_per_1000))
 
     neighbours = spark.read.option("header", True).csv(
         str(ROOT / "data/processed/reference/lad_neighbours.csv")).select("lad_code", "neighbour_lad_code")
@@ -336,7 +403,7 @@ def write_outputs(spark, features):
     return result
 
 
-def quality(result, checks, partial):
+def quality(result, checks):
     rows = result.count()
     duplicates = result.groupBy("lad_code", "month").count().filter("count != 1").count()
     mismatches = {
@@ -346,6 +413,17 @@ def quality(result, checks, partial):
             F.col("mix_sales_count") != F.col("sales_count")).count()}
     later = result.filter(F.col("split") != "history")
     missing_required = {c: later.filter(F.col(c).isNull()).count() for c in REQUIRED_OUTSIDE_HISTORY}
+    missing_required.update({c: result.filter(F.col(c).isNull()).count() for c in REQUIRED_ALL_ROWS})
+    crime_rows = {
+        "observed": result.filter(F.col("crime_data_ok") == 1).count(),
+        "imputed": result.filter(F.col("crime_imputed") == 1).count(),
+        "partial_upload": result.filter(F.col("crime_partial_upload") == 1).count(),
+        "still_missing": result.filter(F.col("crime_per_1000").isNull()).count(),
+        "still_missing_by_force": {r["dominant_force"]: r["count"] for r in result.filter(
+            F.col("crime_per_1000").isNull()).groupBy("dominant_force").count().collect()},
+        "imputed_months_by_force": {r["dominant_force"]: r["months"] for r in result.filter(
+            F.col("crime_imputed") == 1).groupBy("dominant_force").agg(
+            F.countDistinct("month").alias("months")).collect()}}
     lag_check = (result.alias("a").join(result.alias("b"), F.col("a.lad_code") == F.col("b.lad_code"))
                  .filter(F.col("a.t_index") == F.col("b.t_index") + 12)
                  .filter(F.col("a.rent_lag12") != F.col("b.rent_gbp_month")).count())
@@ -354,11 +432,7 @@ def quality(result, checks, partial):
     null_by_split = {r["split"]: {c: r[c] for c in numeric if r[c]} for r in nulls.collect()}
     metrics = {"rows": rows, "columns": len(result.columns), "duplicate_keys": duplicates,
                "source_mismatches": mismatches, "rent_lag12_mismatches": lag_check,
-               "required_nulls_outside_history": missing_required,
-               "partial_force_months": [f"{r['dominant_force']} {r['month']}" for r in
-                                        partial.orderBy("dominant_force", "month").collect()],
-               "partial_upload_rows": result.filter(F.col("crime_partial_upload") == 1).count(),
-               "crime_not_ok_rows": result.filter(F.col("crime_data_ok") == 0).count(),
+               "required_nulls": missing_required, "street_crime_rows": crime_rows,
                "null_counts_by_split": null_by_split}
     metrics["passed"] = (rows == 37920 and duplicates == 0 and lag_check == 0 and
                          not any(mismatches.values()) and not any(missing_required.values()))
@@ -373,10 +447,9 @@ def main():
              .config("spark.sql.shuffle.partitions", "16").getOrCreate())
     spark.sparkContext.setLogLevel("ERROR")
     try:
-        partial = partial_force_months(spark).cache()
-        features, checks = build(spark, partial)
+        features, checks = build(spark)
         result = write_outputs(spark, features)
-        metrics = quality(result, checks, partial)
+        metrics = quality(result, checks)
         summary = {k: v for k, v in metrics.items() if k != "null_counts_by_split"}
         print(json.dumps(summary, indent=2), flush=True)
         if not metrics["passed"]:

@@ -12,7 +12,7 @@ police-recorded street crime, and lagged disposable household income.
 
 | Folder | Contents |
 |---|---|
-| `data/raw/` | Unmodified downloaded source files. Includes ONS PIPR, ONS local-authority GDHI, ONS postcode directory, Price Paid, and street-crime CSVs. |
+| `data/raw/` | Unmodified downloaded source files. Includes ONS PIPR, ONS local-authority GDHI, ONS postcode directory, Price Paid, street-crime CSVs, and Home Office CSP recorded crime (`Home Office Crime/`). |
 | `data/processed/reference/` | Normalized rent, income/population, postcode, and LSOA lookups. |
 | `data/processed/sales_transactions/`, `crime_events/` | Validated event-level Parquet from the first ingestion stage. |
 | `data/processed/local_authority/sales_events/`, `crime_events/` | Those events mapped to a local authority, partitioned by year. |
@@ -48,7 +48,24 @@ Ireland files are not in the crime baseline.
   files for a local authority's dominant territorial police force make
   `crime_count` null; `crime_count_observed` remains available for auditing.
   Even complete files can contain records without an assignable LSOA; those
-  records are excluded and counted in `failed/`.
+  records are excluded and counted in `failed/`. A published file is also
+  treated as missing (`crime_partial_upload`) when the force-month has under
+  50% of the force's median monthly records (Greater Manchester 2022-08,
+  Dyfed-Powys 2023-05 and 2024-01..04) or the authority has under 25% of its
+  own median (Leicestershire 2020-03, where the source left most records
+  without an LSOA). Greater Manchester published no street crime from 2019-07
+  to 2024-12.
+* **Recorded crime:** Home Office *Police recorded crime Community Safety
+  Partnership open data* (quarterly, by offence; fraud excluded) is complete for
+  every force, including Greater Manchester. `prepare_home_office_crime.py` maps
+  CSPs to rent local authorities: predecessor CSPs merge into successor
+  authorities, and CSPs covering several authorities (e.g. South
+  Nottinghamshire, Western Suffolk, Cwm Taf) are split by population and
+  flagged `recorded_crime_allocated`. Offences with no CSP ("Unassigned", up to
+  a third of Kent in 2024/25 and nearly all of Suffolk in 2015-Q2/Q3) are
+  redistributed within force, quarter, and offence group using each CSP's share
+  over the previous four quarters. It excludes anti-social behaviour, which
+  police.uk includes.
 * **Income and population:** ONS *Regional gross disposable household income:
   local authorities*, Tables 1–3, provide annual total GDHI, population, and
   GDHI per person. A month in year *Y* uses the **previous year's** values
@@ -100,17 +117,21 @@ with) and `use_forecast` (only information available before month *t*).
 | Geography (static) | centroid, `dist_to_london_km`, `urban_postcode_share`, `imd_deprivation_score`, `lad_type`, `is_london` |
 | Income/population (Y−1) | `log_gdhi_per_head`, `log_population`, `population_growth`, `gdhi_per_head_growth` |
 | Housing market | trailing 3/12-month sale medians, sales per 1000 residents, property-type / new-build / leasehold shares, `price_to_income_ratio` |
-| Crime | `crime_per_1000_roll12`, eight crime-group rates, `crime_yoy_log_change` |
+| Street crime (police.uk) | `crime_per_1000_roll12`, eight crime-group rates incl. anti-social behaviour, `crime_yoy_log_change` |
+| Recorded crime (Home Office) | `recorded_crime_per_1000_roll4q`, nine offence-group rates, `recorded_crime_yoy_log_change`; `*_prevq` versions use only completed quarters |
 | Spatial | mean of the 5 nearest local authorities: lagged rent, sale prices, crime |
 | Lagged (forecast) | rent lags 1/3/12, lagged rent growth, `*_lag1` copies of market and crime features |
 
 Rolling windows are trailing and require full windows (crime: at least 6 valid
-months), so 2015 (`history`) is mostly null for those features. Crime months are
-treated as invalid, not zero, when the dominant force file is missing or the
-upload is partial (`crime_partial_upload`: the force published < 50% of its
-median monthly records, or the authority received < 25% of its median). Crime
-features remain null for 1–6% of later rows, depending on the split. Imputation, scaling, and
-categorical encoding are left to the model and must be fitted on `train` rows.
+months), so 2015 (`history`) is mostly null for those features. Street-crime
+gaps of at most 12 consecutive months (176 rows: Devon and Cornwall, Dyfed-Powys,
+Staffordshire, and four single months) are imputed as the same month a year
+earlier times the region's year-on-year change and flagged `crime_imputed`;
+on observed months this rule has a median absolute error of 6.9%. Greater
+Manchester's 66-month gap (660 rows) is not imputed: use the recorded-crime
+features, which are complete for every row and correlate 0.94 with street
+crime elsewhere. Any other imputation, scaling, and categorical encoding are
+left to the model and must be fitted on `train` rows.
 `data/metadata/feature_quality.json` reports null counts by split and checks.
 
 ## Reproduce
@@ -125,6 +146,7 @@ uv run python source_inventory.py
 uv run python prepare_reference.py
 uv run python run_pipeline.py --resume
 uv run python prepare_local_authority.py
+uv run python prepare_home_office_crime.py
 uv run python build_local_authority_panel.py --resume
 uv run python validate_local_authority.py
 uv run python prepare_lad_geography.py
@@ -143,7 +165,9 @@ several Python installations, set `PYSPARK_PYTHON` and
 `local_authority_panel_quality.json`, and
 `local_authority_independent_validation.json` provide inspectable evidence.
 Validation checks the 37,920-row grain, key uniqueness, time split, annual lag,
-income coverage, region CSV counts, and missing-crime handling.
+income coverage, region CSV counts, missing and partial street-crime handling,
+and recorded-crime completeness. `recorded_crime_reference.json` reports the
+CSP mapping, redistributed unassigned offences, and allocated authorities.
 
-Sources: [ONS PIPR](https://www.ons.gov.uk/economy/inflationandpriceindices/datasets/priceindexofprivaterentsukmonthlypricestatistics), [ONS local-authority GDHI](https://www.ons.gov.uk/economy/regionalaccounts/grossdisposablehouseholdincome/datasets/regionalgrossdisposablehouseholdincomelocalauthorities), [HM Land Registry Price Paid](https://www.gov.uk/government/statistical-data-sets/price-paid-data-downloads), [Police.uk data](https://data.police.uk/data/), [ONS Postcode Directory August 2024](https://www.data.gov.uk/dataset/f888a19a-ceca-4502-8090-bf6e5aa71d1e/ons-postcode-directory-august-2024-for-the-uk).
+Sources: [ONS PIPR](https://www.ons.gov.uk/economy/inflationandpriceindices/datasets/priceindexofprivaterentsukmonthlypricestatistics), [ONS local-authority GDHI](https://www.ons.gov.uk/economy/regionalaccounts/grossdisposablehouseholdincome/datasets/regionalgrossdisposablehouseholdincomelocalauthorities), [HM Land Registry Price Paid](https://www.gov.uk/government/statistical-data-sets/price-paid-data-downloads), [Police.uk data](https://data.police.uk/data/), [Home Office police recorded crime CSP open data](https://www.gov.uk/government/statistical-data-sets/police-recorded-crime-and-outcomes-open-data-tables), [ONS Postcode Directory August 2024](https://www.data.gov.uk/dataset/f888a19a-ceca-4502-8090-bf6e5aa71d1e/ons-postcode-directory-august-2024-for-the-uk).
 

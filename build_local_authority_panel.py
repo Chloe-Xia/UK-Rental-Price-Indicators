@@ -11,6 +11,7 @@ import csv
 import json
 import re
 import shutil
+import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,12 @@ from prepare_reference import REGIONS
 
 ROOT = Path(__file__).resolve().parent
 YEAR_RANGE = range(2015, 2025)
+# A published file can still be a partial upload: a force-month with fewer than
+# half the force's median monthly records (e.g. Greater Manchester 2022-08), or
+# an authority with under a quarter of its median count because the source left
+# most of its records without an LSOA (Leicestershire 2020-03).
+PARTIAL_FORCE_RATIO = 0.5
+PARTIAL_LAD_RATIO = 0.25
 
 
 def save(df, path: Path):
@@ -100,6 +107,24 @@ def crime_year(spark, year: int, lsoa, areas):
     return {"accepted": valid.count(), "failed_by_reason": failure_counts(spark, failed_path)}
 
 
+def partial_uploads(by_force, home_map, present):
+    force_totals = defaultdict(dict)
+    for r in by_force.groupBy("force", "month").agg(F.sum("crime_count_observed").alias("n")).collect():
+        force_totals[r["force"]][r["month"]] = r["n"]
+    partial = {(force, month) for force, months in force_totals.items()
+               for month, n in months.items()
+               if n < PARTIAL_FORCE_RATIO * statistics.median(months.values())}
+    lad_totals = defaultdict(dict)
+    for r in by_force.groupBy("lad_code", "month").agg(F.sum("crime_count_observed").alias("n")).collect():
+        lad_totals[r["lad_code"]][r["month"]] = r["n"]
+    for lad, force in home_map.items():
+        published = {month: n for month, n in lad_totals[lad].items()
+                     if (month, force) in present and (month, force) not in partial}
+        typical = statistics.median(published.values())
+        partial |= {(lad, month) for month, n in published.items() if n < PARTIAL_LAD_RATIO * typical}
+    return partial
+
+
 def crime_coverage(spark, areas):
     paths = [str(ROOT / f"data/processed/local_authority/crime_force_monthly/year={y}")
              for y in YEAR_RANGE]
@@ -116,6 +141,7 @@ def crime_coverage(spark, areas):
             match = re.fullmatch(r"(\d{4}-\d{2})-([a-z-]+)-street\.csv", path.name)
             if match:
                 present.add((match.group(1), match.group(2)))
+    partial = partial_uploads(by_force, home_map, present)
     area_rows = [(r["lad_code"], r["target_region_code"]) for r in areas.collect()]
     rows = []
     for year in YEAR_RANGE:
@@ -123,10 +149,11 @@ def crime_coverage(spark, areas):
             month = f"{year}-{month_number:02d}"
             for lad, region in area_rows:
                 force = home_map.get(lad, "")
-                complete = bool(force) and (month, force) in present
-                rows.append((lad, region, month, force, complete))
+                published = bool(force) and (month, force) in present
+                incomplete = published and ((force, month) in partial or (lad, month) in partial)
+                rows.append((lad, region, month, force, published and not incomplete, incomplete))
     schema = ["lad_code", "region_code", "month", "dominant_force",
-              "crime_coverage_complete"]
+              "crime_coverage_complete", "crime_partial_upload"]
     coverage = spark.createDataFrame(rows, schema)
     save(coverage, ROOT / "data/processed/local_authority/crime_coverage")
     with (ROOT / "data/metadata/local_authority_crime_coverage.csv").open(
@@ -134,9 +161,10 @@ def crime_coverage(spark, areas):
         writer = csv.writer(output)
         writer.writerow(schema)
         writer.writerows(rows)
-    missing = Counter(region for _, region, _, _, complete in rows if not complete)
+    missing = Counter(region for _, region, _, _, complete, _ in rows if not complete)
     return by_force, coverage, {"lads_with_dominant_force": len(home_map),
                                 "incomplete_lad_months": sum(missing.values()),
+                                "partial_upload_lad_months": sum(row[-1] for row in rows),
                                 "incomplete_by_region": dict(missing)}
 
 
@@ -152,10 +180,20 @@ def build_panel(spark, areas):
         str(ROOT / "data/processed/reference/gdhi_lad_annual.csv"))
               .select("lad_code", F.col("year").cast("int").alias("feature_year"),
                       "gdhi_total_gbp_million", "gdhi_per_head_gbp", "population"))
+    recorded = (spark.read.option("header", True).csv(
+        str(ROOT / "data/processed/reference/recorded_crime_lad_quarterly.csv"))
+                .select("lad_code", F.col("quarter").alias("recorded_crime_quarter"),
+                        F.col("recorded_crime_total").cast("double").alias("recorded_crime_quarter_count"),
+                        F.col("force_unassigned_share").cast("double").alias("recorded_crime_unassigned_share"),
+                        (F.col("allocated") == "True").alias("recorded_crime_allocated")))
+    quarter = F.concat(F.substring("month", 1, 4), F.lit("-Q"),
+                       F.ceil(F.substring("month", 6, 2).cast("int") / 3).cast("string"))
     panel = (rent.join(sales, ["lad_code", "month"], "left")
              .join(crime, ["lad_code", "month"], "left")
-             .join(coverage.select("lad_code", "month", "dominant_force",
-                                   "crime_coverage_complete"), ["lad_code", "month"], "left")
+             .join(coverage.select("lad_code", "month", "dominant_force", "crime_coverage_complete",
+                                   "crime_partial_upload"), ["lad_code", "month"], "left")
+             .withColumn("recorded_crime_quarter", quarter)
+             .join(recorded, ["lad_code", "recorded_crime_quarter"], "left")
              .withColumn("feature_year", F.substring("month", 1, 4).cast("int") - 1)
              .join(income, ["lad_code", "feature_year"], "left"))
     numeric = ["rent_gbp_month", "rent_index", "rent_one_bed_gbp",
@@ -179,7 +217,9 @@ def build_panel(spark, areas):
                "rent_three_bed_gbp", "rent_four_plus_bed_gbp", "rent_flat_gbp",
                "sales_median_gbp", "flat_sales_median_gbp", "sales_count", "flat_sales_count",
                "sales_data_present", "crime_count", "crime_count_observed",
-               "crime_per_1000_residents", "crime_coverage_complete", "dominant_force",
+               "crime_per_1000_residents", "crime_coverage_complete", "crime_partial_upload",
+               "dominant_force", "recorded_crime_quarter", "recorded_crime_quarter_count",
+               "recorded_crime_unassigned_share", "recorded_crime_allocated",
                "feature_year", "gdhi_total_gbp_million", "gdhi_per_head_gbp", "population"]
     output = ROOT / "data/processed/local_authority/rent_panel"
     panel.select(*columns).write.mode("overwrite").partitionBy("region_code").parquet(str(output))
@@ -211,12 +251,13 @@ def build_panel(spark, areas):
     splits = {r["split"]: r["count"] for r in result.groupBy("split").count().collect()}
     nulls = {column: result.filter(F.col(column).isNull()).count()
              for column in ["rent_gbp_month", "sales_median_gbp", "crime_count",
-                            "gdhi_per_head_gbp", "population"]}
+                            "recorded_crime_quarter_count", "gdhi_per_head_gbp", "population"]}
     metrics = {"rows": row_count, "unique_lads": result.select("lad_code").distinct().count(),
                "duplicate_lad_month_keys": duplicates, "splits": splits,
                "null_counts": nulls, "crime_coverage": coverage_stats}
     json_write(ROOT / "data/metadata/local_authority_panel_quality.json", metrics)
     if row_count != 37920 or duplicates != 0 or metrics["unique_lads"] != 316 or \
+       nulls["recorded_crime_quarter_count"] or \
        splits != {"history": 3792, "train": 26544, "validation": 3792, "test": 3792}:
         raise RuntimeError(f"Local-authority panel grain failed: {metrics}")
     return metrics
@@ -266,7 +307,8 @@ def main():
                         "quality": quality,
                         "source_events": ["processed/sales_transactions", "processed/crime_events"],
                         "reference_files": ["rent_lad_monthly.csv", "gdhi_lad_annual.csv",
-                                            "postcode_lad.csv", "lsoa_lad.csv"]})
+                                            "postcode_lad.csv", "lsoa_lad.csv",
+                                            "recorded_crime_lad_quarterly.csv"]})
             print(json.dumps(quality, indent=2), flush=True)
     finally:
         spark.stop()
