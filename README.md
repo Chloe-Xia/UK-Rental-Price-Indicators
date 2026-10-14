@@ -20,6 +20,8 @@ police-recorded street crime, and lagged disposable household income.
 | `data/processed/local_authority/rent_panel/` | **Primary modeling table**, Parquet partitioned by `region_code`. |
 | `data/processed/local_authority/rent_panel.csv` | Same full table in CSV format. |
 | `data/processed/local_authority/by_region/` | Ten CSVs, one per English region or Wales, with local-authority rows. |
+| `data/processed/local_authority/features/`, `features.csv` | **Feature table** for ML and analysis: same 37,920 rows plus engineered features (see below). |
+| `data/processed/reference/lad_geography.csv`, `lad_neighbours.csv` | Static local-authority attributes from ONSPD and the 5 nearest local authorities. |
 | `data/processed/regional_rent_panel/` | Earlier 10-region baseline, retained for comparison. |
 | `data/failed/` | Rejected source rows and newly rejected local-authority mappings, with reasons. |
 | `data/metadata/` | Source inventory, accepted/rejected counts, geographic coverage, and validation results. |
@@ -84,18 +86,49 @@ study. For genuine forward prediction, lag those features and account for
 their publication delay. Rows within an authority and neighboring months are
 correlated; 37,920 rows are not 37,920 independent rental contracts.
 
+## Feature table
+
+`build_features.py` adds features to the panel without changing its grain.
+`data/metadata/feature_dictionary.csv` documents every column with a `role`
+and two flags: `use_association` (contemporaneous study of what rent co-moves
+with) and `use_forecast` (only information available before month *t*).
+
+| Group | Examples |
+|---|---|
+| Target variants | `log_rent`, `rent_yoy_log_change`, `rent_relative_to_national`, `rent_relative_to_region` — never predictors |
+| Time | `t_index`, `month_sin/cos`, `covid_restrictions`, `transaction_tax_holiday` (England/Wales dates differ) |
+| Geography (static) | centroid, `dist_to_london_km`, `urban_postcode_share`, `imd_deprivation_score`, `lad_type`, `is_london` |
+| Income/population (Y−1) | `log_gdhi_per_head`, `log_population`, `population_growth`, `gdhi_per_head_growth` |
+| Housing market | trailing 3/12-month sale medians, sales per 1000 residents, property-type / new-build / leasehold shares, `price_to_income_ratio` |
+| Crime | `crime_per_1000_roll12`, eight crime-group rates, `crime_yoy_log_change` |
+| Spatial | mean of the 5 nearest local authorities: lagged rent, sale prices, crime |
+| Lagged (forecast) | rent lags 1/3/12, lagged rent growth, `*_lag1` copies of market and crime features |
+
+Rolling windows are trailing and require full windows (crime: at least 6 valid
+months), so 2015 (`history`) is mostly null for those features. Crime months are
+treated as invalid, not zero, when the dominant force file is missing or the
+upload is partial (`crime_partial_upload`: the force published < 50% of its
+median monthly records, or the authority received < 25% of its median). Crime
+features remain null for 1–6% of later rows, depending on the split. Imputation, scaling, and
+categorical encoding are left to the model and must be fitted on `train` rows.
+`data/metadata/feature_quality.json` reports null counts by split and checks.
+
 ## Reproduce
 
-Requires Python ≥3.10, Java 17, PySpark 3.5, and openpyxl. From project root:
+Requires Python 3.10–3.11, Java 17, PySpark 3.5, and openpyxl. On Windows,
+Spark also needs `HADOOP_HOME` pointing to a folder whose `bin/` contains
+`winutils.exe` and `hadoop.dll` (Hadoop 3.3.x). From project root:
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 source_inventory.py
-python3 prepare_reference.py
-python3 run_pipeline.py --resume
-python3 prepare_local_authority.py
-python3 build_local_authority_panel.py --resume
-python3 validate_local_authority.py
+uv sync
+uv run python source_inventory.py
+uv run python prepare_reference.py
+uv run python run_pipeline.py --resume
+uv run python prepare_local_authority.py
+uv run python build_local_authority_panel.py --resume
+uv run python validate_local_authority.py
+uv run python prepare_lad_geography.py
+uv run python build_features.py
 ```
 
 The first two ingestion scripts create validated source events and retain the
