@@ -25,6 +25,9 @@ police-recorded street crime, and lagged disposable household income.
 | `data/processed/regional_rent_panel/` | Earlier 10-region baseline, retained for comparison. |
 | `data/failed/` | Rejected source rows and newly rejected local-authority mappings, with reasons. |
 | `data/metadata/` | Source inventory, accepted/rejected counts, geographic coverage, and validation results. |
+| `data/raw/Boundaries/` | ONS *Local Authority Districts (December 2024) Boundaries UK BUC* GeoJSON, used only to draw maps. |
+| `analysis/` | Spark/MLlib analysis scripts for the report (see **Analysis** below). |
+| `reports/figures/`, `reports/tables/` | Figures and small result tables written by `analysis/`. |
 
 `house_hold_debt.xlsx` and `total_wealth.xlsx` remain in `raw/` but are not used.
 Police outcomes, stop-and-search, British Transport Police (`btp`), and Northern
@@ -136,7 +139,8 @@ left to the model and must be fitted on `train` rows.
 
 ## Reproduce
 
-Requires Python 3.10–3.11, Java 17, PySpark 3.5, and openpyxl. On Windows,
+Requires Python 3.10–3.11, Java 17, PySpark 3.5, and openpyxl (plus matplotlib and
+geopandas for `analysis/`; all installed by `uv sync`). On Windows,
 Spark also needs `HADOOP_HOME` pointing to a folder whose `bin/` contains
 `winutils.exe` and `hadoop.dll` (Hadoop 3.3.x). From project root:
 
@@ -168,6 +172,35 @@ Validation checks the 37,920-row grain, key uniqueness, time split, annual lag,
 income coverage, region CSV counts, missing and partial street-crime handling,
 and recorded-crime completeness. `recorded_crime_reference.json` reports the
 CSP mapping, redistributed unassigned offences, and allocated authorities.
+
+## Analysis
+
+The report is an **association study** on `features.csv`,
+2016–2024. Each script reads `data/processed/local_authority/features.csv`
+and writes to `reports/`. Maps also need the boundary GeoJSON
+([Local Authority Districts (December 2024) Boundaries UK BUC](https://ckan.publishing.service.gov.uk/dataset/local-authority-districts-december-2024-boundaries-uk-buc),
+GeoJSON format) saved in `data/raw/Boundaries/`. From project root, after `build_features.py`:
+
+```bash
+uv run python analysis/01_spatiotemporal.py    # rent growth map + regional rent index
+uv run python analysis/02_within_regression.py # within-LAD regression of annual rent growth
+uv run python analysis/03_clustering.py        # KMeans rental-market profiles
+uv run python analysis/04_report_figure.py     # combined report figure (needs 01 and 03)
+```
+
+| Script | Method | Outputs |
+|---|---|---|
+| `01_spatiotemporal.py` | Spark aggregation: LAD rent growth 2016→2024 and population-weighted regional index (2016 = 100) | `fig1_rent_space_time.png`, `lad_rent_growth.csv`, `region_rent_monthly.csv` |
+| `02_within_regression.py` | LAD × year panel of log changes; MLlib `LinearRegression` pooled, with LAD fixed effects, and with LAD + year fixed effects (demeaning via window functions); LAD-clustered standard errors | `within_regression.csv` |
+| `03_clustering.py` | MLlib `StandardScaler` + `KMeans` on five LAD profiles (log rent, rent growth, price-to-income, log recorded crime, urban share); k chosen by silhouette (`ClusteringEvaluator`) | `fig3_rent_clusters.png`, `cluster_*.csv`, `lad_clusters.csv` |
+| `04_report_figure.py` | Three-panel figure from the 01/03 tables (no Spark) | `fig_report.png` |
+
+Notes: the boundary file uses the pre-2024 codes for Barnsley (`E08000016`) and
+Sheffield (`E08000019`); the scripts recode them to `E08000038`/`E08000039`.
+City of London and the Isles of Scilly have no PIPR rent and are drawn grey.
+KMeans uses a fixed seed, but cluster sizes can shift by one or two authorities
+across machines; `reports/tables/lad_clusters.csv` records the assignment used
+in the report.
 
 Sources: [ONS PIPR](https://www.ons.gov.uk/economy/inflationandpriceindices/datasets/priceindexofprivaterentsukmonthlypricestatistics), [ONS local-authority GDHI](https://www.ons.gov.uk/economy/regionalaccounts/grossdisposablehouseholdincome/datasets/regionalgrossdisposablehouseholdincomelocalauthorities), [HM Land Registry Price Paid](https://www.gov.uk/government/statistical-data-sets/price-paid-data-downloads), [Police.uk data](https://data.police.uk/data/), [Home Office police recorded crime CSP open data](https://www.gov.uk/government/statistical-data-sets/police-recorded-crime-and-outcomes-open-data-tables), [ONS Postcode Directory August 2024](https://www.data.gov.uk/dataset/f888a19a-ceca-4502-8090-bf6e5aa71d1e/ons-postcode-directory-august-2024-for-the-uk).
 
