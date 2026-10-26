@@ -1,0 +1,7 @@
+term,(1) pooled coef,(1) pooled se_cluster,(1) pooled se_mllib,(2) LAD FE coef,(2) LAD FE se_cluster,(2) LAD FE se_mllib,(3) LAD + year FE coef,(3) LAD + year FE se_cluster,(3) LAD + year FE se_mllib
+House prices (dlog),0.0253,0.0096,0.0109,0.0075,0.0114,0.0111,0.1169,0.0129,0.0104
+Recorded crime (dlog),-0.0106,0.0035,0.0042,-0.0074,0.0039,0.0042,0.0073,0.0044,0.0039
+GDHI per head growth (Y-1),0.3803,0.0155,0.0175,0.3536,0.0219,0.0177,0.0689,0.0207,0.0198
+Population growth (Y-1),1.2639,0.0677,0.0604,1.7708,0.0943,0.0771,0.6825,0.0966,0.0663
+R2,0.2776,,,0.3233,,,0.1011,,
+N,2844,,,2844,,,2844,,
