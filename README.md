@@ -1,4 +1,4 @@
-# UK Rental Price Indicators — data pipeline
+# UK Rental Price Indicators — data pipeline and analysis
 
 The **primary modeling table** is now one published ONS rent estimate per
 **local authority × month**, January 2015 through December 2024. It contains
@@ -7,6 +7,27 @@ area-month rent statistic, **not an individual tenancy or property listing**.
 
 The goal is to study associations between monthly private rent, home sales,
 police-recorded street crime, and lagged disposable household income.
+
+Final project for ID2221 Data-Intensive Computing at KTH (Fall 2026).
+Data ingestion: Yixin Xia · Feature engineering and panel: Xinyue Feng ·
+Analysis: Hsi-Jui Chang. Full write-up: [final report](reports/ID_2221_Final_Project.pdf).
+
+## Key findings
+
+- **Rent over time and space.** The average local authority's nominal rent rose
+  33% over 2016–2024. Regional cities grew fastest (Salford +61%, Leicester +57%,
+  Manchester +55%); London grew only 32%, behind every region except the North East.
+- **House prices and rent.** In pooled data, house prices look unrelated to rent.
+  Once local-authority and year fixed effects are removed (demeaning with Spark
+  window functions, MLlib `LinearRegression`, standard errors clustered by local
+  authority), 10% faster price growth goes with 1.2% faster rent growth. The
+  national divergence in 2023–24 (rents +6–8% a year while prices stalled) was
+  hiding this local link. Recorded crime shows no within-area association.
+- **Rental-market profiles.** KMeans on five standardised profiles separates
+  stagnant former industrial areas, fast-rising regional cities, rural areas, and
+  London with its commuter belt.
+
+![Rent growth, regional index and market profiles](reports/figures/fig_report.png)
 
 ## Folder contract
 
@@ -203,4 +224,3 @@ across machines; `reports/tables/lad_clusters.csv` records the assignment used
 in the report.
 
 Sources: [ONS PIPR](https://www.ons.gov.uk/economy/inflationandpriceindices/datasets/priceindexofprivaterentsukmonthlypricestatistics), [ONS local-authority GDHI](https://www.ons.gov.uk/economy/regionalaccounts/grossdisposablehouseholdincome/datasets/regionalgrossdisposablehouseholdincomelocalauthorities), [HM Land Registry Price Paid](https://www.gov.uk/government/statistical-data-sets/price-paid-data-downloads), [Police.uk data](https://data.police.uk/data/), [Home Office police recorded crime CSP open data](https://www.gov.uk/government/statistical-data-sets/police-recorded-crime-and-outcomes-open-data-tables), [ONS Postcode Directory August 2024](https://www.data.gov.uk/dataset/f888a19a-ceca-4502-8090-bf6e5aa71d1e/ons-postcode-directory-august-2024-for-the-uk).
-
